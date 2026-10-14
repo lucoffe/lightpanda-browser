@@ -1488,6 +1488,35 @@ fn testHTTPHandler(req: *std.http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/cache/big")) {
+        const body: [4096]u8 = @splat('x');
+        return req.respond(&body, .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain" },
+                .{ .name = "Cache-Control", .value = "max-age=600" },
+            },
+        });
+    }
+
+    // No Content-Length: the entry size limit is only passed as the body arrives.
+    if (std.mem.eql(u8, path, "/cache/big-chunked")) {
+        var send_buffer: [1024]u8 = undefined;
+        var res = try req.respondStreaming(&send_buffer, .{
+            .respond_options = .{
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "text/plain" },
+                    .{ .name = "Cache-Control", .value = "max-age=600" },
+                },
+            },
+        });
+        for (0..4) |_| {
+            const chunk: [1024]u8 = @splat('x');
+            try res.writer.writeAll(&chunk);
+            try res.writer.flush();
+        }
+        return res.end();
+    }
+
     // 401 without an Authorization header; with one, 304 for the validator
     // "v1" and 200 otherwise.
     if (std.mem.eql(u8, path, "/cache/auth")) {

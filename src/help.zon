@@ -470,6 +470,16 @@
     \\          soft: it is enforced at startup and when a browser session ends.
     \\          The cache can temporarily exceed it. 0 means no limit.
     \\          Defaults to 1000.
+    \\  --http-cache-entry-size-limit <BYTES>
+    \\          A response larger than this many bytes (body and headers) is
+    \\          not stored in the HTTP cache. 0 means no limit.
+    \\          Defaults to 0.
+    \\  --http-cache-size-limit <BYTES>
+    \\          Total bytes (bodies and headers) kept in the HTTP cache. Like
+    \\          --http-cache-entry-limit it is enforced at startup and when a
+    \\          browser session ends, expired entries first, then the oldest
+    \\          stored. The cache can temporarily exceed it. 0 means no limit.
+    \\          Defaults to 0.
     \\  --http-connect-timeout <INT>
     \\          Time in ms to establish an HTTP connection before timing out. 0 means
     \\          never.

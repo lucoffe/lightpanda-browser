@@ -46,6 +46,8 @@ pub fn init(allocator: std.mem.Allocator, config: *const lp.Config) !Cache {
         .{ .path = cache_path },
         .{
             .entry_limit = config.httpCacheEntryLimit(),
+            .size_limit = config.httpCacheSizeLimit(),
+            .entry_size_limit = config.httpCacheEntrySizeLimit(),
             .connections = config.httpCacheConnections(),
         },
     ) catch |err| switch (err) {
@@ -81,6 +83,14 @@ pub fn active(self: *Cache) ?*Cache {
     return switch (self.kind) {
         .noop => null,
         inline else => self,
+    };
+}
+
+/// --http-cache-entry-size-limit, 0 when there is none or no cache.
+pub fn entrySizeLimit(self: *const Cache) u64 {
+    return switch (self.kind) {
+        .noop => 0,
+        .sqlite => |*c| c.options.entry_size_limit,
     };
 }
 

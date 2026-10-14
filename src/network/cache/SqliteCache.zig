@@ -43,6 +43,10 @@ options: Options,
 pub const Options = struct {
     /// Entries kept, the oldest stored evicted first (--http-cache-entry-limit); 0 = no limit.
     entry_limit: u32 = 0,
+    /// Total bytes of the entries, bodies and headers (--http-cache-size-limit); 0 = no limit.
+    size_limit: u64 = 0,
+    /// Bytes of one entry, body and headers (--http-cache-entry-size-limit); 0 = no limit.
+    entry_size_limit: u64 = 0,
     /// SQLite connections shared by the browser sessions (--http-cache-connections).
     connections: u8 = Pool.default_connections,
     /// SQLite's busy timeout, and how long a lookup or a store waits for a
@@ -103,10 +107,23 @@ const cache_migrations: []const Migration = &.{
     \\ ) strict
     },
     .{ .sql = "create index header_url on header(url)" },
+    // Replaced by cache_evict, which leads with stored_at.
     .{ .sql = "create index cache_stored_at on cache(stored_at)" },
     .{ .sql =
     \\ create index cache_expiry on cache(stored_at + max_age - age_at_store)
     \\     where etag is null and last_modified is null
+    },
+    // Body and header bytes of an entry, for --http-cache-size-limit. The
+    // column lands after the body, so without cache_evict, which covers
+    // every column evict_over_size_sql reads, size eviction would read every
+    // entry's body. Built in the same step so an upgraded cache is scanned
+    // once; entries stored before it count as 0 bytes until they are
+    // replaced or renewed. cache_evict leads with stored_at, so it also
+    // serves the count eviction, and cache_stored_at goes.
+    .{ .sql =
+    \\ alter table cache add column size integer not null default 0;
+    \\ create index cache_evict on cache(stored_at, size, max_age, age_at_store);
+    \\ drop index cache_stored_at;
     },
 };
 
@@ -116,6 +133,52 @@ const purge_expired_sql =
     \\ where etag is null and last_modified is null
     \\     and stored_at + max_age - age_at_store <= $1
 ;
+
+// Evicts the oldest stored entries past the newest $1.
+const evict_over_count_sql =
+    \\ delete from cache
+    \\ where rowid in (
+    \\     select rowid from cache
+    \\     order by stored_at desc
+    \\     limit -1 offset $1
+    \\ )
+;
+
+// Don't change the columns this reads without also updating the cache_evict
+// index. Evicts, expired entries first and then the oldest stored, until the
+// total size is within $2. The running sum includes the row itself, so a row
+// goes while the bytes freed before it are short of the excess. "Expired"
+// here is past max-age only: a must-revalidate entry, which every lookup
+// revalidates, is not ranked first until its max-age has passed too.
+const evict_over_size_sql =
+    \\ delete from cache where rowid in (
+    \\     select rowid from (
+    \\         select rowid, size, sum(size) over (
+    \\             order by (stored_at + max_age - age_at_store <= $1) desc, stored_at, rowid
+    \\         ) as running
+    \\         from cache
+    \\     ) where running - size < (select total(size) from cache) - $2
+    \\ )
+;
+
+// Index-only: under the limit, the size eviction's window query is skipped.
+const total_size_sql = "select total(size) from cache";
+
+const update_size_sql =
+    \\ update cache set size = length(body) +
+    \\     (select coalesce(sum(length(name) + length(value)), 0) from header where header.url = cache.url)
+    \\ where url = $1
+    \\ returning size
+;
+
+// The bytes put stores for an entry: body, and every header name and value,
+// Vary rows included. update_size_sql counts the same.
+fn entrySize(req: CachePutRequest, body: []const u8) u64 {
+    var size: u64 = body.len;
+    for (req.headers) |h| size += h.name.len + h.value.len;
+    for (req.vary_headers) |h| size += h.name.len + h.value.len;
+    return size;
+}
 
 const SqliteCachePath = union(enum) {
     path: []const u8,
@@ -188,7 +251,14 @@ pub fn init(allocator: std.mem.Allocator, path: SqliteCachePath, options: Option
     var cache: SqliteCache = .{ .allocator = allocator, .pool = pool, .options = options };
     cache.maintenance(lp.datetime.timestamp(.real));
 
-    log.info(.cache, "sqlite cache initialized", .{ .path = path, .entry_limit = options.entry_limit, .connections = pool.conns.len, .version = version });
+    log.info(.cache, "sqlite cache initialized", .{
+        .path = path,
+        .entry_limit = options.entry_limit,
+        .size_limit = options.size_limit,
+        .entry_size_limit = options.entry_size_limit,
+        .connections = pool.conns.len,
+        .version = version,
+    });
     return cache;
 }
 
@@ -196,7 +266,7 @@ pub fn deinit(self: *SqliteCache) void {
     self.pool.deinit(self.allocator);
 }
 
-/// Removes expired entries and enforces size limit.
+/// Removes expired entries and enforces the entry and size limits.
 pub fn maintenance(self: *SqliteCache, now: u64) void {
     const conn = self.pool.acquire() catch |err| {
         logFailure("maintenance", err, null);
@@ -209,22 +279,28 @@ pub fn maintenance(self: *SqliteCache, now: u64) void {
     };
     const purged = conn.changes();
 
-    if (self.options.entry_limit == 0) {
-        return;
+    var evicted: i64 = 0;
+    if (self.options.entry_limit > 0) {
+        conn.exec(evict_over_count_sql, .{@as(i64, @intCast(self.options.entry_limit))}) catch |err| {
+            logFailure("evict overflow", err, null);
+        };
+        evicted += conn.changes();
+    }
+    if (self.options.size_limit > 0) size: {
+        const limit: i64 = @intCast(@min(self.options.size_limit, std.math.maxInt(i64)));
+        const total = conn.scalar(f64, total_size_sql, .{}) catch |err| {
+            logFailure("evict over size", err, null);
+            break :size;
+        } orelse 0;
+        if (total <= @as(f64, @floatFromInt(limit))) break :size;
+        conn.exec(evict_over_size_sql, .{ @as(i64, @intCast(now)), limit }) catch |err| {
+            logFailure("evict over size", err, null);
+            break :size;
+        };
+        evicted += conn.changes();
     }
 
-    conn.exec(
-        \\ delete from cache
-        \\ where rowid in (
-        \\     select rowid from cache
-        \\     order by stored_at desc
-        \\     limit -1 offset $1
-        \\ )
-    , .{@as(i64, @intCast(self.options.entry_limit))}) catch |err| {
-        logFailure("evict overflow", err, null);
-    };
-
-    log.debug(.cache, "maintenance", .{ .purged = purged, .evicted = conn.changes() });
+    log.debug(.cache, "maintenance", .{ .purged = purged, .evicted = evicted });
 }
 
 pub fn get(self: *SqliteCache, arena: std.mem.Allocator, req: CacheGetRequest) !CacheGetResult {
@@ -321,6 +397,12 @@ pub fn get(self: *SqliteCache, arena: std.mem.Allocator, req: CacheGetRequest) !
 }
 
 pub fn put(self: *SqliteCache, req: CachePutRequest, body: []const u8) !void {
+    const size = entrySize(req, body);
+    if (self.options.entry_size_limit > 0 and size > self.options.entry_size_limit) {
+        log.debug(.cache, "no store", .{ .url = req.url, .size = size, .reason = "too large" });
+        return error.EntryTooLarge;
+    }
+
     const conn = try self.pool.acquire();
     defer self.pool.release(conn);
 
@@ -332,8 +414,8 @@ pub fn put(self: *SqliteCache, req: CachePutRequest, body: []const u8) !void {
     try conn.exec(
         \\ insert into cache
         \\     (url, status, stored_at, age_at_store, max_age, must_revalidate,
-        \\     content_type, etag, last_modified, body)
-        \\ values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        \\     content_type, etag, last_modified, body, size)
+        \\ values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
     , .{
         req.url,
         @as(i64, @intCast(req.status)),
@@ -345,6 +427,7 @@ pub fn put(self: *SqliteCache, req: CachePutRequest, body: []const u8) !void {
         req.etag,
         req.last_modified,
         Blob{ .data = body },
+        @as(i64, @intCast(size)),
     });
 
     var lower_name: [256]u8 = undefined;
@@ -440,6 +523,19 @@ pub fn renew(self: *SqliteCache, _: std.mem.Allocator, req: RenewResponse) !void
             "insert into header (url, name, value, vary) values ($1, $2, $3, false)",
             .{ req.url, name, Blob{ .data = h.value } },
         );
+    }
+
+    const size = (try conn.scalar(i64, update_size_sql, .{req.url})) orelse 0;
+
+    // Longer headers can take the entry past the limit: it goes, as a put
+    // of that size would not have been stored.
+    if (self.options.entry_size_limit > 0) {
+        if (@as(u64, @intCast(size)) > self.options.entry_size_limit) {
+            try conn.exec("delete from cache where url = $1", .{req.url});
+            try conn.commit();
+            log.debug(.cache, "evict", .{ .url = req.url, .size = size, .reason = "too large" });
+            return;
+        }
     }
 
     try conn.commit();
@@ -1117,4 +1213,289 @@ test "SqliteCache: evicts oldest entries over the limit" {
         try testing.expect(hit == .hit);
         try testing.expectEqualStrings(url, hit.hit.data.buffer);
     }
+}
+
+fn testPut(cache: *Cache, url: [:0]const u8, stored_at: u64, max_age: u64, etag: ?[]const u8, body: []const u8) !void {
+    try cache.put(.{
+        .url = url,
+        .content_type = "text/plain",
+        .status = 200,
+        .stored_at = stored_at,
+        .age_at_store = 0,
+        .cache_control = .{ .max_age = max_age },
+        .etag = etag,
+        .headers = &.{},
+        .vary_headers = &.{},
+    }, body);
+}
+
+fn testGet(cache: *Cache, arena: std.mem.Allocator, url: []const u8, at: u64) !std.meta.Tag(CacheGetResult) {
+    return std.meta.activeTag(try cache.get(arena, .{ .url = url, .timestamp = at, .request_headers = &.{} }));
+}
+
+test "SqliteCache: size limit evicts expired entries first, then the oldest stored" {
+    // 4 entries of 10 bytes, a 20-byte cap: 20 bytes go.
+    var cache = Cache{ .kind = .{ .sqlite = try .init(testing.allocator, .memory, .{ .size_limit = 20 }) } };
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // the newest, but expired at 4600 (it has an etag, so the expiry purge keeps it)
+    try testPut(&cache, "https://example.com/expired", 4500, 100, "\"e\"", "0123456789");
+    try testPut(&cache, "https://example.com/old", 2000, 100_000, null, "0123456789");
+    try testPut(&cache, "https://example.com/mid", 3000, 100_000, null, "0123456789");
+    try testPut(&cache, "https://example.com/new", 4000, 100_000, null, "0123456789");
+
+    cache.maintenance(5000);
+
+    try testing.expectEqual(.miss, try testGet(&cache, arena.allocator(), "https://example.com/expired", 5000));
+    try testing.expectEqual(.miss, try testGet(&cache, arena.allocator(), "https://example.com/old", 5000));
+    try testing.expectEqual(.hit, try testGet(&cache, arena.allocator(), "https://example.com/mid", 5000));
+    try testing.expectEqual(.hit, try testGet(&cache, arena.allocator(), "https://example.com/new", 5000));
+}
+
+test "SqliteCache: size counts the body and the headers, and an entry over the entry size limit is not stored" {
+    var cache = Cache{ .kind = .{ .sqlite = try .init(testing.allocator, .memory, .{ .entry_size_limit = 10 }) } };
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const req = CachePutRequest{
+        .url = "https://example.com/e",
+        .content_type = "text/plain",
+        .status = 200,
+        .stored_at = 5000,
+        .age_at_store = 0,
+        .cache_control = .{ .max_age = 600 },
+        .headers = &.{.{ .name = "a", .value = "bc" }}, // 3 bytes
+        // a Vary header the request lacked, as tryCache records it: 2 bytes
+        .vary_headers = &.{.{ .name = "vv", .value = "" }},
+    };
+    try cache.put(req, "12345"); // 5 + 3 + 2 = 10: fits
+    try testing.expectEqual(.hit, try testGet(&cache, arena.allocator(), "https://example.com/e", 5000));
+    {
+        const conn = try cache.kind.sqlite.pool.acquire();
+        defer cache.kind.sqlite.pool.release(conn);
+        try testing.expectEqual(10, (try conn.scalar(i64, "select size from cache where url = $1", .{"https://example.com/e"})).?);
+        // what a renewal recounts agrees with what put stored
+        try conn.exec(update_size_sql, .{"https://example.com/e"});
+        try testing.expectEqual(10, (try conn.scalar(i64, "select size from cache where url = $1", .{"https://example.com/e"})).?);
+    }
+
+    var big = req;
+    big.url = "https://example.com/big";
+    try testing.expectError(error.EntryTooLarge, cache.put(big, "123456")); // 11 bytes
+    try testing.expectEqual(.miss, try testGet(&cache, arena.allocator(), "https://example.com/big", 5000));
+}
+
+test "SqliteCache: a renewal recounts the size, and one that outgrows the entry size limit evicts the entry" {
+    var cache = Cache{ .kind = .{ .sqlite = try .init(testing.allocator, .memory, .{ .entry_size_limit = 11 }) } };
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    try cache.put(.{
+        .url = "https://example.com/e",
+        .content_type = "text/plain",
+        .status = 200,
+        .stored_at = 5000,
+        .age_at_store = 0,
+        .cache_control = .{ .max_age = 600 },
+        .headers = &.{.{ .name = "a", .value = "bc" }}, // 3 bytes
+        .vary_headers = &.{},
+    }, "12345"); // 8 bytes
+
+    // longer headers recount the size: 5 + 6 = 11, still within the limit
+    try cache.renew(arena.allocator(), .{ .url = "https://example.com/e", .timestamp = 5100, .headers = &.{.{ .name = "xy", .value = "zzzz" }} });
+    {
+        const conn = try cache.kind.sqlite.pool.acquire();
+        defer cache.kind.sqlite.pool.release(conn);
+        try testing.expectEqual(11, (try conn.scalar(i64, "select size from cache where url = $1", .{"https://example.com/e"})).?);
+    }
+    try testing.expectEqual(.hit, try testGet(&cache, arena.allocator(), "https://example.com/e", 5100));
+
+    // 5 + 7 = 12 is over the limit: the entry goes, with its headers
+    try cache.renew(arena.allocator(), .{ .url = "https://example.com/e", .timestamp = 5200, .headers = &.{.{ .name = "xy", .value = "zzzzz" }} });
+    try testing.expectEqual(.miss, try testGet(&cache, arena.allocator(), "https://example.com/e", 5200));
+    const conn = try cache.kind.sqlite.pool.acquire();
+    defer cache.kind.sqlite.pool.release(conn);
+    try testing.expectEqual(0, (try conn.scalar(i64, "select count(*) from header", .{})).?);
+}
+
+test "SqliteCache: a size limit below one entry empties the cache and puts keep working" {
+    var cache = Cache{ .kind = .{ .sqlite = try .init(testing.allocator, .memory, .{ .size_limit = 4 }) } };
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    try testPut(&cache, "https://example.com/a", 5000, 600, null, "0123456789");
+    cache.maintenance(5000);
+    try testing.expectEqual(.miss, try testGet(&cache, arena.allocator(), "https://example.com/a", 5000));
+
+    try testPut(&cache, "https://example.com/a", 5001, 600, null, "0123456789");
+    try testing.expectEqual(.hit, try testGet(&cache, arena.allocator(), "https://example.com/a", 5001));
+}
+
+// Fails when `sql`, an explained query, scans the cache table itself rather
+// than an index that covers the query: such a scan reads every row, body
+// included. With `want`, also fails unless some step contains it.
+fn expectNoTableScan(conn: anytype, sql: []const u8, values: anytype, want: ?[]const u8) !void {
+    var explained = try conn.rows(sql, values);
+    defer explained.deinit();
+
+    var steps: usize = 0;
+    var found = want == null;
+    while (try explained.next()) |step| {
+        steps += 1;
+        const detail = step.get([]const u8, 3);
+        if (want) |w| {
+            if (std.mem.find(u8, detail, w) != null) found = true;
+        }
+        if (std.mem.startsWith(u8, detail, "SCAN cache") and std.mem.find(u8, detail, "COVERING INDEX") == null) {
+            std.debug.print("query step: {s}\n", .{detail});
+            return error.FullTableScan;
+        }
+    }
+    if (steps == 0) return error.NothingExplained;
+    if (!found) {
+        std.debug.print("no query step contains: {s}\n", .{want.?});
+        return error.IndexNotUsed;
+    }
+}
+
+test "SqliteCache: maintenance's queries do not scan the cache table" {
+    var cache = try SqliteCache.init(testing.allocator, .memory, .{});
+    defer cache.deinit();
+
+    const conn = try cache.pool.acquire();
+    defer cache.pool.release(conn);
+
+    try expectNoTableScan(conn, "explain query plan " ++ purge_expired_sql, .{@as(i64, 0)}, null);
+    try expectNoTableScan(conn, "explain query plan " ++ evict_over_count_sql, .{@as(i64, 3)}, "COVERING INDEX cache_evict");
+    try expectNoTableScan(conn, "explain query plan " ++ total_size_sql, .{}, "COVERING INDEX cache_evict");
+    try expectNoTableScan(conn, "explain query plan " ++ evict_over_size_sql, .{ @as(i64, 0), @as(i64, 1000) }, "COVERING INDEX cache_evict");
+}
+
+test "SqliteCache: maintenance does not read the bodies" {
+    const sqlite3 = @import("../../storage/sqlite/Sqlite.zig").c;
+    const body_pages = 16;
+    const entries = 8;
+
+    var cache = Cache{ .kind = .{ .sqlite = try .init(testing.allocator, .memory, .{ .entry_limit = 100, .size_limit = 1 << 30 }) } };
+    defer cache.deinit();
+    const conn = cache.kind.sqlite.pool.conns[0];
+
+    // Each body spans body_pages pages of whatever size the database uses.
+    const page_size: usize = @intCast((try conn.scalar(i64, "pragma page_size", .{})).?);
+    const body = try testing.allocator.alloc(u8, body_pages * page_size);
+    defer testing.allocator.free(body);
+    @memset(body, 'x');
+
+    var url_buf: [64]u8 = undefined;
+    for (0..entries) |i| {
+        const url = try std.fmt.bufPrintSentinel(&url_buf, "https://example.com/{d}", .{i}, 0);
+        try testPut(&cache, url, 5000 + i, 600, null, body);
+    }
+
+    var cur: c_int = 0;
+    var high: c_int = 0;
+    _ = sqlite3.sqlite3_db_status(conn.conn, sqlite3.SQLITE_DBSTATUS_CACHE_HIT, &cur, &high, 1);
+    _ = sqlite3.sqlite3_db_status(conn.conn, sqlite3.SQLITE_DBSTATUS_CACHE_MISS, &cur, &high, 1);
+
+    // Nothing is expired, over the count or over the size: nothing goes.
+    // Under the size limit maintenance skips the size eviction, so it runs
+    // here too, with the same limit.
+    cache.kind.sqlite.maintenance(5000 + entries);
+    try conn.exec(evict_over_size_sql, .{ @as(i64, 5000 + entries), @as(i64, 1 << 30) });
+
+    var hits: c_int = 0;
+    var misses: c_int = 0;
+    _ = sqlite3.sqlite3_db_status(conn.conn, sqlite3.SQLITE_DBSTATUS_CACHE_HIT, &hits, &high, 0);
+    _ = sqlite3.sqlite3_db_status(conn.conn, sqlite3.SQLITE_DBSTATUS_CACHE_MISS, &misses, &high, 0);
+    const pages: usize = @intCast(hits + misses);
+    if (pages >= body_pages) {
+        std.debug.print("maintenance read {d} pages, one body is {d}\n", .{ pages, body_pages });
+        return error.ReadTheBodies;
+    }
+    try testing.expectEqual(entries, (try conn.scalar(i64, "select count(*) from cache", .{})).?);
+}
+
+test "SqliteCache: a cache at the size limit is left alone, one byte over it is evicted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_]struct { limit: u64, kept: bool }{
+        .{ .limit = 20, .kept = true }, // exactly at the limit: the eviction is skipped
+        .{ .limit = 19, .kept = false },
+    }) |case| {
+        var cache = Cache{ .kind = .{ .sqlite = try .init(testing.allocator, .memory, .{ .size_limit = case.limit }) } };
+        defer cache.deinit();
+        try testPut(&cache, "https://example.com/old", 4000, 100_000, null, "0123456789");
+        try testPut(&cache, "https://example.com/new", 4500, 100_000, null, "0123456789");
+        cache.maintenance(5000);
+        const want: std.meta.Tag(CacheGetResult) = if (case.kept) .hit else .miss;
+        try testing.expectEqual(want, try testGet(&cache, arena.allocator(), "https://example.com/old", 5000));
+        try testing.expectEqual(.hit, try testGet(&cache, arena.allocator(), "https://example.com/new", 5000));
+    }
+}
+
+test "SqliteCache: a cache from before the size column is upgraded on open, and puts, gets and size eviction work on it" {
+    const lp_testing = @import("../../testing.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try lp_testing.tmpPath(&tmp, "cache");
+    try std.Io.Dir.cwd().createDirPath(lp.io, dir);
+    const db_path = try testing.allocator.printSentinel("{s}/cache.db", .{dir}, 0);
+    defer testing.allocator.free(db_path);
+
+    const now = lp.datetime.timestamp(.real);
+    var old_len: usize = 0;
+    {
+        // A cache as the previous version left it: every migration but the
+        // last, and an entry whose body spans several pages.
+        var pool = try Pool.init(testing.allocator, db_path, .{});
+        defer pool.deinit(testing.allocator);
+        const conn = try pool.acquire();
+        defer pool.release(conn);
+        _ = try Migrations.run(conn, cache_migrations[0 .. cache_migrations.len - 1]);
+        const page_size: usize = @intCast((try conn.scalar(i64, "pragma page_size", .{})).?);
+        const old_body = try testing.allocator.alloc(u8, 3 * page_size);
+        defer testing.allocator.free(old_body);
+        old_len = old_body.len;
+        @memset(old_body, 'o');
+        try conn.exec(
+            \\ insert into cache (url, status, stored_at, age_at_store, max_age, must_revalidate, content_type, body)
+            \\ values ('https://example.com/old', 200, $1, 0, 600, 0, 'text/plain', $2)
+        , .{ @as(i64, @intCast(now - 10)), Blob{ .data = old_body } });
+        try conn.exec("insert into header (url, name, value, vary) values ('https://example.com/old', 'x-old', x'31', 0)", .{});
+    }
+
+    // 150 bytes: the two new 100-byte entries do not both fit.
+    var cache = Cache{ .kind = .{ .sqlite = try .init(testing.allocator, .{ .path = dir }, .{ .size_limit = 150 }) } };
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    {
+        const conn = try cache.kind.sqlite.pool.acquire();
+        defer cache.kind.sqlite.pool.release(conn);
+        try testing.expectEqual(1, (try conn.scalar(i64, "select count(*) from pragma_index_list('cache') where name = 'cache_evict'", .{})).?);
+        try testing.expectEqual(0, (try conn.scalar(i64, "select count(*) from pragma_index_list('cache') where name = 'cache_stored_at'", .{})).?);
+        // the old entry counts as 0 bytes until it is replaced or renewed
+        try testing.expectEqual(0, (try conn.scalar(i64, "select size from cache where url = 'https://example.com/old'", .{})).?);
+    }
+    {
+        const got = try cache.get(arena.allocator(), .{ .url = "https://example.com/old", .timestamp = now, .request_headers = &.{} });
+        try testing.expect(got == .hit);
+        try testing.expectEqual(old_len, got.hit.data.buffer.len);
+    }
+
+    const body: [100]u8 = @splat('n');
+    try testPut(&cache, "https://example.com/a", now - 5, 600, null, &body);
+    try testPut(&cache, "https://example.com/b", now, 600, null, &body);
+
+    // 200 bytes over 150: the oldest stored go until the rest fits.
+    cache.maintenance(now);
+    try testing.expectEqual(.miss, try testGet(&cache, arena.allocator(), "https://example.com/old", now));
+    try testing.expectEqual(.miss, try testGet(&cache, arena.allocator(), "https://example.com/a", now));
+    try testing.expectEqual(.hit, try testGet(&cache, arena.allocator(), "https://example.com/b", now));
 }

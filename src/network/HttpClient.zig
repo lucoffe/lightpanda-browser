@@ -1446,6 +1446,7 @@ fn cachePutRequest(transfer: *Transfer, rh: *http.ResponseHead) !?Cache.CachePut
 // headers and the buffered body. Failures are logged, never fatal — the
 // consumer gets its response either way.
 fn cacheStore(self: *Client, transfer: *Transfer) void {
+    const revalidating = transfer._cache_intent == .revalidate;
     switch (transfer._cache_intent) {
         .none => return,
         .store => {},
@@ -1462,6 +1463,13 @@ fn cacheStore(self: *Client, transfer: *Transfer) void {
     // could have been disabled while waiting of the response
     const cache = self.cache.active() orelse return;
 
+    if (transfer.res.cache_too_large) {
+        // The stored entry, if any, is out of date and is not replaced.
+        if (revalidating) cache.evict(transfer._cache_key);
+        log.debug(.cache, "no store", .{ .url = transfer._cache_key, .reason = "too large" });
+        return;
+    }
+
     const rh = &(transfer.res.header orelse return);
 
     const maybe_req = cachePutRequest(transfer, rh) catch |err| {
@@ -1473,8 +1481,11 @@ fn cacheStore(self: *Client, transfer: *Transfer) void {
     if (comptime lp.IS_DEBUG) {
         log.debug(.browser, "http cache", .{ .key = transfer._cache_key, .put = req });
     }
-    cache.put(req, transfer.res.buffer.items) catch |err| {
-        _ = cacheFailed(cache, "store failed", err, transfer._cache_key);
+    cache.put(req, transfer.res.buffer.items) catch |err| switch (err) {
+        // Body and headers together passed the limit: the stale entry, if
+        // any, goes, as when the body alone passed it.
+        error.EntryTooLarge => if (revalidating) cache.evict(transfer._cache_key),
+        else => _ = cacheFailed(cache, "store failed", err, transfer._cache_key),
     };
 }
 
@@ -3437,6 +3448,15 @@ pub const Transfer = struct {
         }
     }
 
+    // A response past --http-cache-entry-size-limit is not stored: from here
+    // on its body is buffered for the consumer only. A streaming transfer
+    // (EventSource) never has a cache intent, so it is never stored either.
+    fn checkCacheSize(self: *Transfer, len: usize) void {
+        if (self._cache_intent == .none or self.res.cache_too_large) return;
+        const limit = self.client.cache.entrySizeLimit();
+        if (limit > 0 and len > limit) self.res.cache_too_large = true;
+    }
+
     // Serve a cache entry as this transfer's response. Takes ownership of
     // `cached` (file-backed bodies are read into the arena and closed).
     fn bufferCached(self: *Transfer, cached: Cache.CachedResponse, cache_state: ResourceTiming.CacheState) !void {
@@ -4124,6 +4144,7 @@ pub const Transfer = struct {
                         res.callback_error = error.ResponseTooLarge;
                         return http.writefunc_error;
                     }
+                    transfer.checkCacheSize(cl);
                     // TODO: Because of compression, Content-Length is the wire
                     // length, not necessarily the final length. The chunks
                     // are read into the transfer.*ARENA* so growth doesn't free
@@ -4193,6 +4214,7 @@ pub const Transfer = struct {
             res.callback_error = err;
             return http.writefunc_error;
         };
+        transfer.checkCacheSize(res.buffer.items.len);
 
         if (transfer.state == .aborted) {
             return http.writefunc_error;
@@ -4522,6 +4544,10 @@ const Response = struct {
     // apart from a real CURLE_WRITE_ERROR and deliver the response (headers,
     // status, kept prefix) as a success.
     partial_abort: bool = false,
+
+    // The body passed --http-cache-entry-size-limit: it is still held whole
+    // for the consumer, as every non-streaming body is, but never stored.
+    cache_too_large: bool = false,
 
     // Response body. Filled by dataCallback, consumed in processMessages.
     // See Stream.spare to see how this works in streaming mode
@@ -6359,6 +6385,7 @@ const TestCacheRequest = struct {
     done: bool = false,
     err: ?anyerror = null,
     from_cache: bool = false,
+    cache_too_large: bool = false, // the transfer's flag, as the consumer sees it
 
     fn deinit(self: *TestCacheRequest) void {
         self.body.deinit(testing.allocator);
@@ -6409,11 +6436,13 @@ const TestCacheRequest = struct {
     fn headerCallback(transfer: *Transfer) !Transfer.HeaderResult {
         const self: *TestCacheRequest = @ptrCast(@alignCast(transfer.req.ctx));
         self.from_cache = transfer._from_cache;
+        self.cache_too_large = self.cache_too_large or transfer.res.cache_too_large;
         return .proceed;
     }
 
     fn dataCallback(transfer: *Transfer, data: []const u8) !void {
         const self: *TestCacheRequest = @ptrCast(@alignCast(transfer.req.ctx));
+        self.cache_too_large = self.cache_too_large or transfer.res.cache_too_large;
         try self.body.appendSlice(testing.allocator, data);
     }
 
@@ -6806,4 +6835,72 @@ test "HttpClient: a cache that cannot write counts an error and delivers" {
     try testing.expectEqual("cached body", r.body.items);
     try testing.expectEqual(miss + 1, cacheCount(.miss)); // lookups still work
     try testing.expectEqual(errors + 1, cacheFailureCount(.@"error")); // the store failed
+}
+
+test "HttpClient: a response over the entry size limit is delivered whole and not stored" {
+    const client = &testing.test_browser.http_client;
+    var tc = try TestCache.init(client, .{ .entry_size_limit = 1024 });
+    tc.use(client);
+    defer tc.deinit(client);
+
+    for ([_][:0]const u8{ "http://127.0.0.1:9582/cache/big-chunked", "http://127.0.0.1:9582/cache/big" }) |url| {
+        var r: TestCacheRequest = .{};
+        defer r.deinit();
+        try r.run(client, url);
+        try testing.expectEqual(4096, r.body.items.len);
+        // The receiving path caught it, so nothing was even offered to put.
+        try testing.expectEqual(true, r.cache_too_large);
+        try expectCachedAt(&tc, url, 0, .miss);
+    }
+
+    // control: a small response is stored, and served from the cache next
+    {
+        var r: TestCacheRequest = .{};
+        defer r.deinit();
+        try r.run(client, "http://127.0.0.1:9582/cache/max-age");
+        try testing.expectEqual(false, r.from_cache);
+        try testing.expectEqual(false, r.cache_too_large);
+    }
+    var again: TestCacheRequest = .{};
+    defer again.deinit();
+    try again.run(client, "http://127.0.0.1:9582/cache/max-age");
+    try testing.expectEqual(true, again.from_cache);
+    try testing.expectEqual("cached body", again.body.items);
+}
+
+test "HttpClient: a revalidation answered by a body over the entry size limit drops the stale entry" {
+    const client = &testing.test_browser.http_client;
+    var tc = try TestCache.init(client, .{ .entry_size_limit = 1024 });
+    tc.use(client);
+    defer tc.deinit(client);
+
+    const url = "http://127.0.0.1:9582/cache/big";
+    try testSeedStale(&tc, url);
+
+    var r: TestCacheRequest = .{};
+    defer r.deinit();
+    try r.run(client, url);
+    try testing.expectEqual(false, r.from_cache);
+    try testing.expectEqual(4096, r.body.items.len);
+    try testing.expectEqual(true, r.cache_too_large);
+    try expectCachedAt(&tc, url, 0, .miss);
+}
+
+test "HttpClient: a revalidation answered by a response whose headers push it over the entry size limit drops the stale entry" {
+    const client = &testing.test_browser.http_client;
+    // The 11-byte body fits; with the headers it does not.
+    var tc = try TestCache.init(client, .{ .entry_size_limit = 12 });
+    tc.use(client);
+    defer tc.deinit(client);
+
+    const url = "http://127.0.0.1:9582/cache/max-age";
+    try testSeedStale(&tc, url);
+
+    var r: TestCacheRequest = .{};
+    defer r.deinit();
+    try r.run(client, url);
+    try testing.expectEqual(false, r.from_cache);
+    try testing.expectEqual(false, r.cache_too_large);
+    try testing.expectEqual("cached body", r.body.items);
+    try expectCachedAt(&tc, url, 0, .miss);
 }

@@ -277,6 +277,8 @@ const CommonOptions = .{
     .{ .name = "http_cache_connections", .type = ?u8, .default = SqlitePool.default_connections, .validator = httpCacheConnectionsValidator },
     .{ .name = "http_cache_dir", .type = ?[]const u8 },
     .{ .name = "http_cache_entry_limit", .type = ?u32, .default = 1000 },
+    .{ .name = "http_cache_size_limit", .type = ?u64, .default = 0 },
+    .{ .name = "http_cache_entry_size_limit", .type = ?u64, .default = 0 },
     .{ .name = "http_debug", .type = bool },
     .{ .name = "http_curves", .type = ?[:0]const u8, .validator = httpCurvesValidator },
     .{ .name = "render_font", .type = []const u8, .multiple = true },
@@ -820,6 +822,24 @@ pub fn httpCacheEntryLimit(self: *const Config) u32 {
     return switch (self.mode) {
         inline .serve, .fetch, .mcp, .agent => |opts| opts.http_cache_entry_limit.?,
         else => 1000,
+    };
+}
+
+/// --http-cache-size-limit: total bytes (bodies and headers) kept in the
+/// HTTP cache; 0 means no limit.
+pub fn httpCacheSizeLimit(self: *const Config) u64 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_cache_size_limit.?,
+        else => 0,
+    };
+}
+
+/// --http-cache-entry-size-limit: a response larger than this (body and
+/// headers) is not stored; 0 means no limit.
+pub fn httpCacheEntrySizeLimit(self: *const Config) u64 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_cache_entry_size_limit.?,
+        else => 0,
     };
 }
 
@@ -1429,6 +1449,24 @@ test "Config: parseArgs --http-session-timeout" {
         const proc_args: std.process.Args = .{ .vector = &argv };
         const config = try parseArgs(arena.allocator(), proc_args);
         try std.testing.expectEqual(null, config.httpSessionTimeout());
+    }
+}
+
+test "Config: parseArgs http cache byte limits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    {
+        const argv = [_][*:0]const u8{ "lightpanda", "serve" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqual(0, config.httpCacheSizeLimit());
+        try std.testing.expectEqual(0, config.httpCacheEntrySizeLimit());
+        try std.testing.expectEqual(1000, config.httpCacheEntryLimit());
+    }
+    {
+        const argv = [_][*:0]const u8{ "lightpanda", "serve", "--http-cache-size-limit", "2147483648", "--http-cache-entry-size-limit", "16777216" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqual(2147483648, config.httpCacheSizeLimit());
+        try std.testing.expectEqual(16777216, config.httpCacheEntrySizeLimit());
     }
 }
 
