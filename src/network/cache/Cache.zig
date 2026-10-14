@@ -44,7 +44,10 @@ pub fn init(allocator: std.mem.Allocator, config: *const lp.Config) !Cache {
     const sqlite = SqliteCache.init(
         allocator,
         .{ .path = cache_path },
-        config.httpCacheEntryLimit(),
+        .{
+            .entry_limit = config.httpCacheEntryLimit(),
+            .connections = config.httpCacheConnections(),
+        },
     ) catch |err| {
         log.err(.cache, "failed to init", .{
             .kind = "SqliteCache",
@@ -112,6 +115,17 @@ pub fn maintenance(self: *Cache, now: u64) void {
     return switch (self.kind) {
         .noop => {},
         inline else => |*c| c.maintenance(now),
+    };
+}
+
+pub const Failure = SqliteCache.Failure;
+
+/// What a failed lookup, store or renewal counts as in the
+/// http_cache_failure metric.
+pub fn failureOf(self: *const Cache, err: anyerror) Failure {
+    return switch (self.kind) {
+        .noop => .@"error",
+        .sqlite => SqliteCache.failureOf(err),
     };
 }
 

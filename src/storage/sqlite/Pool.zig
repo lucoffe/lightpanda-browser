@@ -29,11 +29,28 @@ available: usize,
 mutex: std.Io.Mutex,
 cond: std.Io.Condition,
 conns: []Sqlite.Conn,
+// How long acquire waits for a free connection, ms; null = until one is released.
+acquire_timeout_ms: ?u32,
 
-pub fn init(allocator: Allocator, path: [:0]const u8) !Pool {
+pub const default_connections: u8 = 5;
+pub const default_busy_timeout_ms: u32 = 1000;
+
+pub const Options = struct {
+    /// Connections in the pool, at least 1 (a pool on an in-memory database
+    /// always has 1).
+    connections: u8 = default_connections,
+    /// SQLite's busy timeout on each connection, ms.
+    busy_timeout_ms: u32 = default_busy_timeout_ms,
+    /// How long acquire waits for a free connection before error.PoolBusy,
+    /// ms; null waits until one is released.
+    acquire_timeout_ms: ?u32 = null,
+};
+
+pub fn init(allocator: Allocator, path: [:0]const u8, opts: Options) !Pool {
+    std.debug.assert(opts.connections > 0);
     // can't have a pool of connections to in-memory database, so, to keep the
     // API simple, we create a pool of 1.
-    const count: usize = if (std.mem.eql(u8, path, ":memory:")) 1 else 5;
+    const count: usize = if (std.mem.eql(u8, path, ":memory:")) 1 else opts.connections;
 
     var conns = try allocator.alloc(Sqlite.Conn, count);
     errdefer allocator.free(conns);
@@ -48,7 +65,7 @@ pub fn init(allocator: Allocator, path: [:0]const u8) !Pool {
     for (0..count) |i| {
         conns[i] = try Sqlite.Conn.open(path);
         initialized += 1;
-        try conns[i].busyTimeout(1000);
+        try conns[i].busyTimeout(@intCast(opts.busy_timeout_ms));
     }
 
     return .{
@@ -56,6 +73,7 @@ pub fn init(allocator: Allocator, path: [:0]const u8) !Pool {
         .mutex = .init,
         .conns = conns,
         .available = count,
+        .acquire_timeout_ms = opts.acquire_timeout_ms,
     };
 }
 
@@ -66,24 +84,30 @@ pub fn deinit(self: *Pool, allocator: Allocator) void {
     allocator.free(self.conns);
 }
 
-pub fn acquire(self: *Pool) !Sqlite.Conn {
-    const conns = self.conns;
+/// A free connection, waiting for one to be released. With an acquire
+/// timeout, gives up with error.PoolBusy once it has passed. Not a
+/// cancelation point.
+pub fn acquire(self: *Pool) error{PoolBusy}!Sqlite.Conn {
+    const timeout: std.Io.Timeout = if (self.acquire_timeout_ms) |ms|
+        (std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } }).toDeadline(lp.io)
+    else
+        .none;
 
     self.mutex.lockUncancelable(lp.io);
-    while (true) {
-        const available = self.available;
-        if (available == 0) {
-            // @ZIG16 Io.Condition has no timedWait; restore the 5s
-            // starvation bail-out when one lands.
-            self.cond.waitUncancelable(lp.io, &self.mutex);
-            continue;
-        }
-        const index = available - 1;
-        const conn = conns[index];
-        self.available = index;
-        self.mutex.unlock(lp.io);
-        return conn;
+    defer self.mutex.unlock(lp.io);
+    // The timed wait is cancelable; acquire, like the lock above, is not.
+    const cancel_protection = lp.io.swapCancelProtection(.blocked);
+    defer _ = lp.io.swapCancelProtection(cancel_protection);
+    while (self.available == 0) {
+        self.cond.waitTimeout(lp.io, &self.mutex, timeout) catch |err| switch (err) {
+            // A connection released as the wait gave up is still taken.
+            error.Timeout => if (self.available == 0) return error.PoolBusy,
+            error.Canceled => unreachable,
+        };
     }
+    const index = self.available - 1;
+    self.available = index;
+    return self.conns[index];
 }
 
 pub fn release(self: *Pool, conn: Sqlite.Conn) void {
@@ -99,13 +123,26 @@ pub fn release(self: *Pool, conn: Sqlite.Conn) void {
 
 const testing = @import("../../testing.zig");
 test "Sqlite: Pool" {
+    try testThreaded(.{}, 6);
+}
+
+test "Sqlite: Pool with an acquire timeout, more threads than connections" {
+    // SqliteCache always sets one, so this is the acquire that runs in production.
+    try testThreaded(.{ .acquire_timeout_ms = 5000 }, 12);
+}
+
+const max_test_threads = 12;
+
+fn testThreaded(opts: Options, thread_count: usize) !void {
+    std.debug.assert(thread_count <= max_test_threads);
+
     // :memory: _has_ to run with a single connection in the pool, which isn't
     // that useful for testing. So we create a temp file.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testing.tmpPath(&tmp, "pool.sqlite");
 
-    var pool = try Pool.init(testing.allocator, path);
+    var pool = try Pool.init(testing.allocator, path, opts);
     defer pool.deinit(testing.allocator);
 
     {
@@ -127,33 +164,33 @@ test "Sqlite: Pool" {
         try conn.exec("pragma journal_mode=memory", .{});
     }
 
-    const t1 = try Thread.spawn(.{}, testPool, .{&pool});
-    const t2 = try Thread.spawn(.{}, testPool, .{&pool});
-    const t3 = try Thread.spawn(.{}, testPool, .{&pool});
-    const t4 = try Thread.spawn(.{}, testPool, .{&pool});
-    const t5 = try Thread.spawn(.{}, testPool, .{&pool});
-    const t6 = try Thread.spawn(.{}, testPool, .{&pool});
+    var failures: std.atomic.Value(usize) = .init(0);
+    var threads: [max_test_threads]Thread = undefined;
+    for (threads[0..thread_count]) |*t| {
+        t.* = try Thread.spawn(.{}, testPool, .{ &pool, &failures });
+    }
+    for (threads[0..thread_count]) |t| t.join();
 
-    t1.join();
-    t2.join();
-    t3.join();
-    t4.join();
-    t5.join();
-    t6.join();
+    // every acquire got a connection, and every connection came back
+    try testing.expectEqual(0, failures.load(.monotonic));
+    try testing.expectEqual(pool.conns.len, pool.available);
 
     const c1 = try pool.acquire();
     defer pool.release(c1);
 
     const row = (try c1.row("select cnt from pool_test", .{})).?;
-    try testing.expectEqual(600, row.get(i64, 0));
+    try testing.expectEqual(@as(i64, @intCast(thread_count * 100)), row.get(i64, 0));
     row.deinit();
 
     try c1.exec("drop table pool_test", .{});
 }
 
-fn testPool(p: *Pool) !void {
+fn testPool(p: *Pool, failures: *std.atomic.Value(usize)) void {
     for (0..100) |_| {
-        const conn = try p.acquire();
+        const conn = p.acquire() catch {
+            _ = failures.fetchAdd(1, .monotonic);
+            continue;
+        };
         conn.exec("begin immediate", .{}) catch unreachable;
         conn.exec("update pool_test set cnt = cnt + 1", .{}) catch |err| {
             std.debug.print("update err: {any}\n", .{err});
@@ -163,4 +200,39 @@ fn testPool(p: *Pool) !void {
         p.release(conn);
         lp.io.sleep(.fromMicroseconds(100), .awake) catch {};
     }
+}
+
+test "Sqlite: Pool acquire gives up past its timeout" {
+    var pool = try Pool.init(testing.allocator, ":memory:", .{ .acquire_timeout_ms = 20 });
+    defer pool.deinit(testing.allocator);
+
+    const held = try pool.acquire();
+    const before = lp.datetime.milliTimestamp(.awake);
+    try testing.expectError(error.PoolBusy, pool.acquire());
+    try testing.expect(lp.datetime.milliTimestamp(.awake) - before >= 20);
+    pool.release(held);
+
+    const again = try pool.acquire();
+    pool.release(again);
+}
+
+test "Sqlite: Pool acquire is woken by a release before its timeout" {
+    var pool = try Pool.init(testing.allocator, ":memory:", .{ .acquire_timeout_ms = 10_000 });
+    defer pool.deinit(testing.allocator);
+
+    const held = try pool.acquire();
+    const releaser = try Thread.spawn(.{}, struct {
+        fn run(p: *Pool, conn: Sqlite.Conn) void {
+            lp.io.sleep(.fromMilliseconds(20), .awake) catch {};
+            p.release(conn);
+        }
+    }.run, .{ &pool, held });
+
+    const before = lp.datetime.milliTimestamp(.awake);
+    const conn = try pool.acquire();
+    const waited = lp.datetime.milliTimestamp(.awake) - before;
+    releaser.join();
+    pool.release(conn);
+    // woken by the release, not by the 10 s timeout
+    try testing.expect(waited < 5_000);
 }

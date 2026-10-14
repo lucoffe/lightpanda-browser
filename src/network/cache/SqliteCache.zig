@@ -38,7 +38,45 @@ pub const SqliteCache = @This();
 
 allocator: std.mem.Allocator,
 pool: Pool,
-entry_limit: u32,
+options: Options,
+
+pub const Options = struct {
+    /// Entries kept, the oldest stored evicted first (--http-cache-entry-limit); 0 = no limit.
+    entry_limit: u32 = 0,
+    /// SQLite connections shared by the browser sessions (--http-cache-connections).
+    connections: u8 = Pool.default_connections,
+    /// SQLite's busy timeout, and how long a lookup or a store waits for a
+    /// free pooled connection, ms. Past it the lookup is a miss and the store
+    /// is skipped (error.PoolBusy / error.Busy).
+    busy_timeout_ms: u32 = Pool.default_busy_timeout_ms,
+};
+
+/// What a failed lookup, store or renewal counts as in the
+/// http_cache_failure metric.
+pub const Failure = enum { busy, @"error" };
+
+pub fn failureOf(err: anyerror) Failure {
+    return switch (err) {
+        error.PoolBusy,
+        error.Busy,
+        error.BusyRecovery,
+        error.BusySnapshot,
+        error.BusyTimeout,
+        error.Locked,
+        error.LockedSharedCache,
+        error.LockedVTab,
+        => .busy,
+        else => .@"error",
+    };
+}
+
+// A busy cache is expected under contention: a debug line, not an error.
+fn logFailure(comptime msg: []const u8, err: anyerror, url: ?[]const u8) void {
+    switch (failureOf(err)) {
+        .busy => log.debug(.cache, msg, .{ .url = url, .err = err }),
+        .@"error" => log.err(.cache, msg, .{ .url = url, .err = err }),
+    }
+}
 
 const cache_migrations: []const Migration = &.{
     .{ .sql =
@@ -95,9 +133,14 @@ const SqliteCachePath = union(enum) {
     }
 };
 
-pub fn init(allocator: std.mem.Allocator, path: SqliteCachePath, entry_limit: u32) !SqliteCache {
+pub fn init(allocator: std.mem.Allocator, path: SqliteCachePath, options: Options) !SqliteCache {
+    const pool_options: Pool.Options = .{
+        .connections = options.connections,
+        .busy_timeout_ms = options.busy_timeout_ms,
+        .acquire_timeout_ms = options.busy_timeout_ms,
+    };
     var pool = switch (path) {
-        .memory => try Pool.init(allocator, ":memory:"),
+        .memory => try Pool.init(allocator, ":memory:", pool_options),
         .path => |cache_dir| blk: {
             std.Io.Dir.cwd().createDirPath(lp.io, cache_dir) catch |e| {
                 log.err(
@@ -114,7 +157,7 @@ pub fn init(allocator: std.mem.Allocator, path: SqliteCachePath, entry_limit: u3
                 0,
             );
             defer allocator.free(full_path);
-            break :blk try Pool.init(allocator, full_path);
+            break :blk try Pool.init(allocator, full_path, pool_options);
         },
     };
     errdefer pool.deinit(allocator);
@@ -133,10 +176,10 @@ pub fn init(allocator: std.mem.Allocator, path: SqliteCachePath, entry_limit: u3
         try conn.exec("pragma foreign_keys=on", .{});
     }
 
-    var cache: SqliteCache = .{ .allocator = allocator, .pool = pool, .entry_limit = entry_limit };
+    var cache: SqliteCache = .{ .allocator = allocator, .pool = pool, .options = options };
     cache.maintenance(lp.datetime.timestamp(.real));
 
-    log.info(.cache, "sqlite cache initialized", .{ .path = path, .entry_limit = entry_limit, .version = version });
+    log.info(.cache, "sqlite cache initialized", .{ .path = path, .entry_limit = options.entry_limit, .connections = pool.conns.len, .version = version });
     return cache;
 }
 
@@ -147,17 +190,17 @@ pub fn deinit(self: *SqliteCache) void {
 /// Removes expired entries and enforces size limit.
 pub fn maintenance(self: *SqliteCache, now: u64) void {
     const conn = self.pool.acquire() catch |err| {
-        log.err(.cache, "sqlite acquire", .{ .err = err });
+        logFailure("maintenance", err, null);
         return;
     };
     defer self.pool.release(conn);
 
     conn.exec(purge_expired_sql, .{@as(i64, @intCast(now))}) catch |err| {
-        log.err(.cache, "purge expired", .{ .err = err });
+        logFailure("purge expired", err, null);
     };
     const purged = conn.changes();
 
-    if (self.entry_limit == 0) {
+    if (self.options.entry_limit == 0) {
         return;
     }
 
@@ -168,8 +211,8 @@ pub fn maintenance(self: *SqliteCache, now: u64) void {
         \\     order by stored_at desc
         \\     limit -1 offset $1
         \\ )
-    , .{@as(i64, @intCast(self.entry_limit))}) catch |err| {
-        log.err(.cache, "evict overflow", .{ .err = err });
+    , .{@as(i64, @intCast(self.options.entry_limit))}) catch |err| {
+        logFailure("evict overflow", err, null);
     };
 
     log.debug(.cache, "maintenance", .{ .purged = purged, .evicted = conn.changes() });
@@ -328,13 +371,13 @@ pub fn clear(self: *SqliteCache) !void {
 
 pub fn evict(self: *SqliteCache, url: []const u8) void {
     const conn = self.pool.acquire() catch |err| {
-        log.err(.cache, "sqlite acquire", .{ .url = url, .err = err });
+        logFailure("evict", err, url);
         return;
     };
     defer self.pool.release(conn);
 
     conn.exec("delete from cache where url = $1", .{url}) catch |err| {
-        log.err(.cache, "delete from cache", .{ .url = url, .err = err });
+        logFailure("evict", err, url);
         return;
     };
 
@@ -401,12 +444,21 @@ pub fn renew(self: *SqliteCache, _: std.mem.Allocator, req: RenewResponse) !void
 const testing = std.testing;
 
 fn setupCache(allocator: std.mem.Allocator) !Cache {
-    return Cache{ .kind = .{ .sqlite = try .init(allocator, .memory, 0) } };
+    return Cache{ .kind = .{ .sqlite = try .init(allocator, .memory, .{}) } };
+}
+
+test "SqliteCache: failureOf" {
+    for ([_]anyerror{ error.PoolBusy, error.Busy, error.BusyTimeout, error.BusySnapshot, error.Locked }) |e| {
+        try testing.expectEqual(Failure.busy, failureOf(e));
+    }
+    for ([_]anyerror{ error.Full, error.IoErr, error.ReadOnly, error.Corrupt, error.OutOfMemory }) |e| {
+        try testing.expectEqual(Failure.@"error", failureOf(e));
+    }
 }
 
 test "SqliteCache: Migrations" {
     const allocator = testing.allocator;
-    var pool = try Pool.init(allocator, ":memory:");
+    var pool = try Pool.init(allocator, ":memory:", .{});
     defer pool.deinit(allocator);
 
     const conn = try pool.acquire();
@@ -990,7 +1042,7 @@ test "SqliteCache: maintenance purges expired entries without validators" {
 }
 
 test "SqliteCache: expired purge uses the cache_expiry index" {
-    var cache = try SqliteCache.init(testing.allocator, .memory, 0);
+    var cache = try SqliteCache.init(testing.allocator, .memory, .{});
     defer cache.deinit();
 
     const conn = try cache.pool.acquire();
@@ -1010,7 +1062,7 @@ test "SqliteCache: expired purge uses the cache_expiry index" {
 }
 
 test "SqliteCache: evicts oldest entries over the limit" {
-    var cache = Cache{ .kind = .{ .sqlite = try .init(testing.allocator, .memory, 3) } };
+    var cache = Cache{ .kind = .{ .sqlite = try .init(testing.allocator, .memory, .{ .entry_limit = 3 }) } };
     defer cache.deinit();
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

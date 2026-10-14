@@ -27,6 +27,7 @@ const Mime = @import("browser/Mime.zig");
 
 const WebBotAuthConfig = @import("network/WebBotAuth.zig").Config;
 const HttpHeader = @import("network/http.zig").Header;
+const SqlitePool = @import("storage/sqlite/Pool.zig");
 
 const log = lp.log;
 const crypto = @import("sys/libcrypto.zig");
@@ -273,6 +274,7 @@ const CommonOptions = .{
     .{ .name = "log_filter", .type = log.FilterRule, .multiple = true, .validator = logFilterValidator },
     .{ .name = "log_filter_scopes", .type = log.FilterRule, .multiple = true, .validator = logFilterValidator, .deprecated = "use --log-filter" },
     .{ .name = "user_agent_suffix", .type = ?[]const u8 },
+    .{ .name = "http_cache_connections", .type = ?u8, .default = SqlitePool.default_connections, .validator = httpCacheConnectionsValidator },
     .{ .name = "http_cache_dir", .type = ?[]const u8 },
     .{ .name = "http_cache_entry_limit", .type = ?u32, .default = 1000 },
     .{ .name = "http_debug", .type = bool },
@@ -818,6 +820,14 @@ pub fn httpCacheEntryLimit(self: *const Config) u32 {
     return switch (self.mode) {
         inline .serve, .fetch, .mcp, .agent => |opts| opts.http_cache_entry_limit.?,
         else => 1000,
+    };
+}
+
+/// --http-cache-connections: the SQLite connections the HTTP cache keeps.
+pub fn httpCacheConnections(self: *const Config) u8 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_cache_connections.?,
+        else => SqlitePool.default_connections,
     };
 }
 
@@ -1422,6 +1432,27 @@ test "Config: parseArgs --http-session-timeout" {
     }
 }
 
+test "Config: parseArgs --http-cache-connections" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    {
+        const argv = [_][*:0]const u8{ "lightpanda", "serve" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqual(SqlitePool.default_connections, config.httpCacheConnections());
+    }
+    {
+        const argv = [_][*:0]const u8{ "lightpanda", "serve", "--http-cache-connections", "8" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqual(8, config.httpCacheConnections());
+    }
+    // 0 would leave no connection; past 255 does not fit
+    for ([_][*:0]const u8{ "0", "256", "x" }) |value| {
+        log.expectLog(&.{.app});
+        const argv = [_][*:0]const u8{ "lightpanda", "serve", "--http-cache-connections", value };
+        try std.testing.expectError(error.InvalidArgument, parseArgs(arena.allocator(), .{ .vector = &argv }));
+    }
+}
+
 test "Config: parseArgs --dump tells a url from a misspelt format" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1705,6 +1736,16 @@ fn timezoneValidator(allocator: Allocator, args: *std.process.Args.Iterator, fie
         return error.InvalidArgument;
     };
     field.* = try allocator.dupeSentinel(u8, str, 0);
+}
+
+fn httpCacheConnectionsValidator(_: Allocator, args: *std.process.Args.Iterator, field: *?u8) !void {
+    const str = args.next() orelse return error.MissingArgument;
+    const n = std.fmt.parseInt(u8, str, 10) catch 0;
+    if (n == 0) {
+        log.fatal(.app, "invalid option value", .{ .arg = "--http-cache-connections", .value = str, .hint = "must be between 1 and 255" });
+        return error.InvalidArgument;
+    }
+    field.* = n;
 }
 
 // libcurl only stores the string; BoringSSL parses it at handshake time, so

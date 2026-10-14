@@ -1276,6 +1276,28 @@ pub fn findHeader(headers: []const http.Header, name: []const u8) ?[]const u8 {
     return null;
 }
 
+// A cache lookup, store or renewal that failed: counted and logged, never
+// fatal. A busy cache is expected under contention, so it is only a debug
+// line (the metric counts it); anything else is a warning. A failure that
+// belongs to one response or entry, not to the cache, is not counted.
+fn cacheFailed(cache: *const Cache, comptime msg: []const u8, err: anyerror, url: []const u8) Cache.Failure {
+    switch (err) {
+        // an entry evicted meanwhile, a header name the cache cannot key
+        error.CacheEntryNotFound, error.HeaderNameTooLong => {
+            log.debug(.cache, msg, .{ .url = url, .err = err });
+            return .@"error";
+        },
+        else => {},
+    }
+    const failure = cache.failureOf(err);
+    lp.metrics.http_cache_failure.incr(failure);
+    switch (failure) {
+        .busy => log.debug(.cache, msg, .{ .url = url, .err = err }),
+        .@"error" => log.warn(.cache, msg, .{ .url = url, .err = err }),
+    }
+    return failure;
+}
+
 // Returns true if the request was served from the cache (response buffered
 // for dispatch). On a miss the transfer is tagged so completion can store
 // the response; on an expired-with-validators entry the request becomes a
@@ -1332,9 +1354,15 @@ fn cacheLookup(self: *Client, transfer: *Transfer) !bool {
         .url = key,
         .timestamp = lp.datetime.timestamp(.real),
         .request_headers = try transfer.cacheRequestHeaders(),
-    }) catch |e| blk: {
-        log.err(.cache, "failed to get", .{ .url = req.url, .err = e });
-        break :blk .miss;
+    }) catch |e| {
+        // A miss: the response goes to the network. After a busy lookup the
+        // request doesn't touch the cache again: no store.
+        lp.metrics.http_cache.incr(.miss);
+        transfer._cache_intent = switch (cacheFailed(cache, "lookup failed", e, req.url)) {
+            .busy => .none,
+            .@"error" => .store,
+        };
+        return false;
     };
 
     switch (cache_result) {
@@ -1393,7 +1421,7 @@ fn cacheRevalidated(self: *Client, transfer: *Transfer) !bool {
         .timestamp = lp.datetime.timestamp(.real),
         .headers = transfer.res.headers,
     }) catch |err| {
-        log.warn(.cache, "renew failed", .{ .err = err });
+        _ = cacheFailed(cache, "renew failed", err, transfer._cache_key);
     };
 
     lp.metrics.http_cache.incr(.revalidated);
@@ -1446,7 +1474,7 @@ fn cacheStore(self: *Client, transfer: *Transfer) void {
         log.debug(.browser, "http cache", .{ .key = transfer._cache_key, .put = req });
     }
     cache.put(req, transfer.res.buffer.items) catch |err| {
-        log.warn(.http, "cache put failed", .{ .err = err });
+        _ = cacheFailed(cache, "store failed", err, transfer._cache_key);
     };
 }
 
@@ -6304,9 +6332,9 @@ const TestCache = struct {
     cache: Cache,
     saved: *Cache,
 
-    fn init(client: *Client) !TestCache {
+    fn init(client: *Client, options: SqliteCache.Options) !TestCache {
         return .{
-            .cache = .{ .kind = .{ .sqlite = try SqliteCache.init(testing.allocator, .memory, 0) } },
+            .cache = .{ .kind = .{ .sqlite = try SqliteCache.init(testing.allocator, .memory, options) } },
             .saved = client.cache,
         };
     }
@@ -6430,7 +6458,7 @@ fn testSeedStale(tc: *TestCache, url: [:0]const u8) !void {
 
 test "HttpClient: Authorization and Range requests bypass the cache" {
     const client = &testing.test_browser.http_client;
-    var tc = try TestCache.init(client);
+    var tc = try TestCache.init(client, .{});
     tc.use(client);
     defer tc.deinit(client);
     const url = "http://127.0.0.1:9582/cache/max-age";
@@ -6502,7 +6530,7 @@ const TestAuthParker = struct {
 
 test "HttpClient: a response to an auth retry is not stored" {
     const client = &testing.test_browser.http_client;
-    var tc = try TestCache.init(client);
+    var tc = try TestCache.init(client, .{});
     tc.use(client);
     defer tc.deinit(client);
     var parker = try TestAuthParker.init();
@@ -6519,7 +6547,7 @@ test "HttpClient: a response to an auth retry is not stored" {
 
 test "HttpClient: an auth retry does not revalidate or renew a stale entry" {
     const client = &testing.test_browser.http_client;
-    var tc = try TestCache.init(client);
+    var tc = try TestCache.init(client, .{});
     tc.use(client);
     defer tc.deinit(client);
     var parker = try TestAuthParker.init();
@@ -6542,7 +6570,7 @@ test "HttpClient: an auth retry does not revalidate or renew a stale entry" {
 
 test "HttpClient: a URL with userinfo bypasses the cache" {
     const client = &testing.test_browser.http_client;
-    var tc = try TestCache.init(client);
+    var tc = try TestCache.init(client, .{});
     tc.use(client);
     defer tc.deinit(client);
 
@@ -6567,7 +6595,7 @@ test "HttpClient: a URL with userinfo bypasses the cache" {
 
 test "HttpClient: a response varying on Cookie is a hit only for the cookies it was stored with" {
     const client = &testing.test_browser.http_client;
-    var tc = try TestCache.init(client);
+    var tc = try TestCache.init(client, .{});
     tc.use(client);
     defer tc.deinit(client);
     const url = "http://127.0.0.1:9582/cache/vary-cookie";
@@ -6600,7 +6628,7 @@ test "HttpClient: a response varying on Cookie is a hit only for the cookies it 
 
 test "HttpClient: the Vary row of a response varying on Cookie holds a digest, not the cookies" {
     const client = &testing.test_browser.http_client;
-    var tc = try TestCache.init(client);
+    var tc = try TestCache.init(client, .{});
     tc.use(client);
     defer tc.deinit(client);
     const url = "http://127.0.0.1:9582/cache/vary-cookie";
@@ -6626,7 +6654,7 @@ test "HttpClient: the Vary row of a response varying on Cookie holds a digest, n
 
 test "HttpClient: a response varying on a header the request lacked is not a hit for a request carrying it" {
     const client = &testing.test_browser.http_client;
-    var tc = try TestCache.init(client);
+    var tc = try TestCache.init(client, .{});
     tc.use(client);
     defer tc.deinit(client);
     const url = "http://127.0.0.1:9582/cache/vary-variant";
@@ -6645,4 +6673,137 @@ test "HttpClient: a response varying on a header the request lacked is not a hit
         try testing.expectEqual(step.hit, r.from_cache);
         try testing.expectEqual("varied", r.body.items);
     }
+}
+
+fn cacheCount(tag: @TypeOf(lp.metrics.http_cache).Tag) usize {
+    return lp.metrics.http_cache.counts.getPtrConst(tag).count;
+}
+
+fn cacheFailureCount(tag: @TypeOf(lp.metrics.http_cache_failure).Tag) usize {
+    return lp.metrics.http_cache_failure.counts.getPtrConst(tag).count;
+}
+
+test "HttpClient: a response is stored, then served from the cache" {
+    const client = &testing.test_browser.http_client;
+    var tc = try TestCache.init(client, .{});
+    tc.use(client);
+    defer tc.deinit(client);
+    const url = "http://127.0.0.1:9582/cache/max-age";
+
+    const miss = cacheCount(.miss);
+    const hit = cacheCount(.hit);
+    {
+        var r: TestCacheRequest = .{};
+        defer r.deinit();
+        try r.run(client, url);
+        try testing.expectEqual(false, r.from_cache);
+    }
+    var again: TestCacheRequest = .{};
+    defer again.deinit();
+    try again.run(client, url);
+    try testing.expectEqual(true, again.from_cache);
+    try testing.expectEqual("cached body", again.body.items);
+    try testing.expectEqual(miss + 1, cacheCount(.miss));
+    try testing.expectEqual(hit + 1, cacheCount(.hit));
+}
+
+test "HttpClient: cacheFailed counts what is the cache's own" {
+    const client = &testing.test_browser.http_client;
+    var tc = try TestCache.init(client, .{});
+    defer tc.cache.deinit();
+    const busy = cacheFailureCount(.busy);
+    const errors = cacheFailureCount(.@"error");
+
+    // belong to one entry or response, not to the cache
+    _ = cacheFailed(&tc.cache, "test", error.HeaderNameTooLong, "http://x");
+    _ = cacheFailed(&tc.cache, "test", error.CacheEntryNotFound, "http://x");
+    try testing.expectEqual(busy, cacheFailureCount(.busy));
+    try testing.expectEqual(errors, cacheFailureCount(.@"error"));
+
+    try testing.expectEqual(.busy, cacheFailed(&tc.cache, "test", error.PoolBusy, "http://x"));
+    try testing.expectEqual(busy + 1, cacheFailureCount(.busy));
+    try testing.expectEqual(errors, cacheFailureCount(.@"error"));
+
+    lp.log.expectLog(&.{.cache});
+    try testing.expectEqual(.@"error", cacheFailed(&tc.cache, "test", error.ReadOnly, "http://x"));
+    try testing.expectEqual(busy + 1, cacheFailureCount(.busy));
+    try testing.expectEqual(errors + 1, cacheFailureCount(.@"error"));
+}
+
+test "HttpClient: a busy lookup is a miss, the store is skipped, and the response is delivered" {
+    const client = &testing.test_browser.http_client;
+    var tc = try TestCache.init(client, .{ .busy_timeout_ms = 20 });
+    tc.use(client);
+    defer tc.deinit(client);
+    const url = "http://127.0.0.1:9582/cache/max-age";
+
+    const busy = cacheFailureCount(.busy);
+    const miss = cacheCount(.miss);
+    // the memory cache has one connection: hold it
+    const pool = &tc.cache.kind.sqlite.pool;
+    const held = try pool.acquire();
+    var r: TestCacheRequest = .{};
+    defer r.deinit();
+    r.run(client, url) catch |err| {
+        pool.release(held);
+        return err;
+    };
+    pool.release(held);
+
+    try testing.expectEqual("cached body", r.body.items);
+    try testing.expectEqual(false, r.from_cache);
+    try testing.expectEqual(busy + 1, cacheFailureCount(.busy)); // the lookup only
+    try testing.expectEqual(miss + 1, cacheCount(.miss));
+    try expectCachedAt(&tc, url, 0, .miss); // nothing was stored
+}
+
+test "HttpClient: a busy store is skipped, and the response is delivered" {
+    const client = &testing.test_browser.http_client;
+    var tc = try TestCache.init(client, .{ .busy_timeout_ms = 20 });
+    tc.use(client);
+    defer tc.deinit(client);
+    const url = "http://127.0.0.1:9582/cache/max-age";
+
+    const busy = cacheFailureCount(.busy);
+    const miss = cacheCount(.miss);
+    var r: TestCacheRequest = .{};
+    defer r.deinit();
+    // The lookup runs as the request is submitted; the store when it completes.
+    _ = try r.start(client, url);
+    const pool = &tc.cache.kind.sqlite.pool;
+    const held = try pool.acquire();
+    r.settle(client) catch |err| {
+        pool.release(held);
+        return err;
+    };
+    pool.release(held);
+
+    try testing.expectEqual("cached body", r.body.items);
+    try testing.expectEqual(miss + 1, cacheCount(.miss));
+    try testing.expectEqual(busy + 1, cacheFailureCount(.busy)); // the store
+    try expectCachedAt(&tc, url, 0, .miss);
+}
+
+test "HttpClient: a cache that cannot write counts an error and delivers" {
+    const client = &testing.test_browser.http_client;
+    var tc = try TestCache.init(client, .{});
+    tc.use(client);
+    defer tc.deinit(client);
+    {
+        const pool = &tc.cache.kind.sqlite.pool;
+        const conn = try pool.acquire();
+        defer pool.release(conn);
+        try conn.exec("pragma query_only = 1", .{});
+    }
+    const errors = cacheFailureCount(.@"error");
+    const miss = cacheCount(.miss);
+
+    lp.log.expectLog(&.{.cache});
+    var r: TestCacheRequest = .{};
+    defer r.deinit();
+    try r.run(client, "http://127.0.0.1:9582/cache/max-age");
+
+    try testing.expectEqual("cached body", r.body.items);
+    try testing.expectEqual(miss + 1, cacheCount(.miss)); // lookups still work
+    try testing.expectEqual(errors + 1, cacheFailureCount(.@"error")); // the store failed
 }

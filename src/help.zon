@@ -454,6 +454,12 @@
     \\                         Worker never runs.
     \\
     \\             none        Request none of them, overriding the default.
+    \\  --http-cache-connections <INT>
+    \\          SQLite connections the HTTP cache keeps for the browser sessions
+    \\          to share, from 1 to 255. A lookup or a store that waits 1 s for
+    \\          a free connection, or for SQLite to unlock the database (up to
+    \\          about 2 s in all), is a miss or a skipped store.
+    \\          Defaults to 5.
     \\  --http-cache-dir <PATH>
     \\          Directory used as a filesystem cache for network resources. Omitting
     \\          this disables caching.
