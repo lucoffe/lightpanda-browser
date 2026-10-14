@@ -408,6 +408,13 @@ pub fn tryCache(arena: std.mem.Allocator, candidate: CacheCandidate) !?CachePutR
         return null;
     }
 
+    // An authentication challenge answers these credentials, or their
+    // absence, at this moment: never one to replay.
+    if (status == 401 or status == 407) {
+        log.debug(.cache, "no store", .{ .url = url, .code = status, .reason = "status" });
+        return null;
+    }
+
     if (response.has_set_cookie) {
         log.debug(.cache, "no store", .{ .url = url, .reason = "has_cookies" });
         return null;
@@ -690,6 +697,26 @@ test "Cache: tryCache heuristic freshness" {
         const result_ = try (TestResponse{ .status = status, .cache_control = "max-age=300" }).run(arena.allocator());
         try testing.expectEqual(null, result_);
     }
+}
+
+test "Cache: tryCache never stores an authentication challenge" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    for ([_]u16{ 401, 407 }) |status| {
+        const explicit = try (TestResponse{ .status = status, .cache_control = "public, max-age=300" }).run(arena.allocator());
+        try testing.expectEqual(null, explicit);
+        const heuristic = try (TestResponse{
+            .status = status,
+            .cache_control = "public",
+            .last_modified = "Mon, 21 Sep 2026 04:13:20 GMT",
+        }).run(arena.allocator());
+        try testing.expectEqual(null, heuristic);
+    }
+
+    // control: the same response with a 403 is stored
+    const forbidden = try (TestResponse{ .status = 403, .cache_control = "public, max-age=300" }).run(arena.allocator());
+    try testing.expectEqual(300, forbidden.?.cache_control.max_age);
 }
 
 test "Cache: tryCache must_revalidate without validators" {

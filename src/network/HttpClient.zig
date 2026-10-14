@@ -1303,6 +1303,18 @@ fn cacheLookup(self: *Client, transfer: *Transfer) !bool {
         return false;
     }
 
+    // A request carrying credentials of its own (the URL's userinfo makes
+    // curl send Basic auth), or asking for part of the body, is neither
+    // answered from nor written to the cache: the stored response may belong
+    // to other credentials, and a 200 is not the range.
+    if (req.basic_auth_credentials != null or
+        URL.hasCredentials(req.url) or
+        transfer.findRequestHeader("Authorization") != null or
+        transfer.findRequestHeader("Range") != null)
+    {
+        return false;
+    }
+
     const arena = transfer.arena;
 
     // Redirects rewrite req.url; the entry must be stored/renewed under the
@@ -3660,12 +3672,7 @@ pub const Transfer = struct {
             return error.TooManyRedirects;
         }
 
-        if (transfer._cache_intent == .revalidate) {
-            transfer._cache_intent.revalidate.data.deinit();
-            transfer.removeHeader("If-None-Match");
-            transfer.removeHeader("If-Modified-Since");
-        }
-        transfer._cache_intent = .none;
+        transfer.dropCacheIntent();
 
         // resolve the redirect target.
         const url: [:0]const u8 = blk: {
@@ -3768,6 +3775,21 @@ pub const Transfer = struct {
 
     pub fn updateCredentials(self: *Transfer, userpwd: [:0]const u8) void {
         self.req.basic_auth_credentials = userpwd;
+        // The retry carries credentials of its own, and does not go back
+        // through the cache lookup: its response is neither stored under the
+        // plain URL nor allowed to renew an entry.
+        self.dropCacheIntent();
+    }
+
+    // The response is no longer the cache's business: a revalidation gives
+    // up the stale entry and the conditional headers cacheLookup put on.
+    fn dropCacheIntent(self: *Transfer) void {
+        if (self._cache_intent == .revalidate) {
+            self._cache_intent.revalidate.data.deinit();
+            self.removeHeader("If-None-Match");
+            self.removeHeader("If-Modified-Since");
+        }
+        self._cache_intent = .none;
     }
 
     const RequestHeader = struct {
@@ -6237,4 +6259,268 @@ test "HttpClient: bodyless status announcing a body" {
     try testing.expectEqual(false, Transfer.announcesBody("Content-Length: 0\r\n"));
     try testing.expectEqual(false, Transfer.announcesBody("Content-Type: text/html\r\n"));
     try testing.expectEqual(false, Transfer.announcesBody("\r\n"));
+}
+
+const SqliteCache = @import("cache/SqliteCache.zig");
+
+// A memory cache owned by a test, swapped in for the test client's.
+const TestCache = struct {
+    cache: Cache,
+    saved: *Cache,
+
+    fn init(client: *Client) !TestCache {
+        return .{
+            .cache = .{ .kind = .{ .sqlite = try SqliteCache.init(testing.allocator, .memory, 0) } },
+            .saved = client.cache,
+        };
+    }
+
+    // Call once the TestCache is at its final address.
+    fn use(self: *TestCache, client: *Client) void {
+        client.cache = &self.cache;
+    }
+
+    fn deinit(self: *TestCache, client: *Client) void {
+        client.cache = self.saved;
+        self.cache.deinit();
+    }
+};
+
+// One GET through a client, settled.
+const TestCacheRequest = struct {
+    header: ?[2][]const u8 = null, // a request header to set
+    notification: ?*Notification = null,
+    body: std.ArrayList(u8) = .empty,
+    done: bool = false,
+    err: ?anyerror = null,
+    from_cache: bool = false,
+
+    fn deinit(self: *TestCacheRequest) void {
+        self.body.deinit(testing.allocator);
+    }
+
+    fn run(self: *TestCacheRequest, client: *Client, url: [:0]const u8) !void {
+        _ = try self.start(client, url);
+        try self.settle(client);
+    }
+
+    fn start(self: *TestCacheRequest, client: *Client, url: [:0]const u8) !*Transfer {
+        const transfer = try client.newRequest(.{
+            .method = .GET,
+            .url = url,
+            .origin = null,
+            .credentials_mode = .omit,
+            .request_mode = .no_cors,
+            .resource_type = .xhr,
+            .notification = self.notification,
+            .ctx = self,
+            .header_callback = headerCallback,
+            .data_callback = dataCallback,
+            .done_callback = doneCallback,
+            .error_callback = errorCallback,
+            .shutdown_callback = noopShutdown,
+        }, null);
+        {
+            errdefer transfer.deinit();
+            if (self.header) |h| try transfer.setHeader(h[0], h[1], .{});
+        }
+        try transfer.submit();
+        return transfer;
+    }
+
+    fn settle(self: *TestCacheRequest, client: *Client) !void {
+        for (0..250) |_| {
+            if (self.done or self.err != null) break;
+            _ = try client.tick(20);
+        } else return error.NeverSettled;
+        // The delivering tick retired the transfer; the next one releases it.
+        _ = try client.tick(0);
+        if (self.err) |e| return e;
+    }
+
+    fn headerCallback(transfer: *Transfer) !Transfer.HeaderResult {
+        const self: *TestCacheRequest = @ptrCast(@alignCast(transfer.req.ctx));
+        self.from_cache = transfer._from_cache;
+        return .proceed;
+    }
+
+    fn dataCallback(transfer: *Transfer, data: []const u8) !void {
+        const self: *TestCacheRequest = @ptrCast(@alignCast(transfer.req.ctx));
+        try self.body.appendSlice(testing.allocator, data);
+    }
+
+    fn doneCallback(ctx: *anyopaque) !void {
+        const self: *TestCacheRequest = @ptrCast(@alignCast(ctx));
+        self.done = true;
+    }
+
+    fn errorCallback(ctx: *anyopaque, err: anyerror) void {
+        const self: *TestCacheRequest = @ptrCast(@alignCast(ctx));
+        self.err = err;
+    }
+};
+
+// What the test's cache answers for url, offset_s seconds from now.
+fn expectCachedAt(tc: *TestCache, url: []const u8, offset_s: u64, want: std.meta.Tag(Cache.CacheGetResult)) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const got = try tc.cache.get(arena.allocator(), .{
+        .url = url,
+        .timestamp = lp.datetime.timestamp(.real) + offset_s,
+        .request_headers = &.{},
+    });
+    try testing.expectEqual(want, std.meta.activeTag(got));
+}
+
+// Stores an entry for url that is stale and carries the validator "v1".
+fn testSeedStale(tc: *TestCache, url: [:0]const u8) !void {
+    try tc.cache.put(.{
+        .url = url,
+        .content_type = "text/plain",
+        .status = 200,
+        .stored_at = lp.datetime.timestamp(.real) - 100,
+        .age_at_store = 0,
+        .cache_control = .{ .max_age = 0 },
+        .etag = "\"v1\"",
+        .headers = &.{},
+        .vary_headers = &.{},
+    }, "old");
+    try expectCachedAt(tc, url, 0, .revalidate);
+}
+
+test "HttpClient: Authorization and Range requests bypass the cache" {
+    const client = &testing.test_browser.http_client;
+    var tc = try TestCache.init(client);
+    tc.use(client);
+    defer tc.deinit(client);
+    const url = "http://127.0.0.1:9582/cache/max-age";
+
+    // carrying Authorization: not stored
+    {
+        var r: TestCacheRequest = .{ .header = .{ "Authorization", "Bearer t" } };
+        defer r.deinit();
+        try r.run(client, url);
+    }
+    try expectCachedAt(&tc, url, 0, .miss);
+
+    // a plain request stores it
+    {
+        var r: TestCacheRequest = .{};
+        defer r.deinit();
+        try r.run(client, url);
+        try testing.expectEqual(false, r.from_cache);
+    }
+
+    // carrying Range or Authorization: never served from it
+    for ([_][2][]const u8{ .{ "Range", "bytes=0-3" }, .{ "Authorization", "Bearer t" } }) |h| {
+        var r: TestCacheRequest = .{ .header = h };
+        defer r.deinit();
+        try r.run(client, url);
+        try testing.expectEqual(false, r.from_cache);
+    }
+
+    // control: a plain request is a hit
+    var r: TestCacheRequest = .{};
+    defer r.deinit();
+    try r.run(client, url);
+    try testing.expectEqual(true, r.from_cache);
+}
+
+// Parks every auth challenge, as the CDP Fetch domain does.
+const TestAuthParker = struct {
+    notification: *Notification,
+
+    fn init() !TestAuthParker {
+        return .{ .notification = try Notification.init(testing.allocator) };
+    }
+
+    fn register(self: *TestAuthParker) !void {
+        try self.notification.register(.http_request_auth_required, self, onAuthRequired);
+    }
+
+    fn deinit(self: *TestAuthParker) void {
+        self.notification.deinit();
+    }
+
+    fn onAuthRequired(_: *anyopaque, msg: *const Notification.RequestAuthRequired) !void {
+        msg.wait_for_interception.* = true;
+    }
+
+    // Starts the request, answers its challenge with credentials, settles it.
+    fn answer(self: *TestAuthParker, client: *Client, r: *TestCacheRequest, url: [:0]const u8) !void {
+        r.notification = self.notification;
+        const transfer = try r.start(client, url);
+        for (0..250) |_| {
+            if (client.intercepted == 1) break;
+            _ = try client.tick(20);
+        } else return error.NeverChallenged;
+        transfer.updateCredentials("u:p");
+        try client.continueTransfer(transfer);
+        try r.settle(client);
+    }
+};
+
+test "HttpClient: a response to an auth retry is not stored" {
+    const client = &testing.test_browser.http_client;
+    var tc = try TestCache.init(client);
+    tc.use(client);
+    defer tc.deinit(client);
+    var parker = try TestAuthParker.init();
+    defer parker.deinit();
+    try parker.register();
+    const url = "http://127.0.0.1:9582/cache/auth";
+
+    var r: TestCacheRequest = .{};
+    defer r.deinit();
+    try parker.answer(client, &r, url);
+    try testing.expectEqual("secret", r.body.items);
+    try expectCachedAt(&tc, url, 0, .miss);
+}
+
+test "HttpClient: an auth retry does not revalidate or renew a stale entry" {
+    const client = &testing.test_browser.http_client;
+    var tc = try TestCache.init(client);
+    tc.use(client);
+    defer tc.deinit(client);
+    var parker = try TestAuthParker.init();
+    defer parker.deinit();
+    try parker.register();
+    const url = "http://127.0.0.1:9582/cache/auth";
+    try testSeedStale(&tc, url);
+
+    // The first attempt was conditional on the stale entry's ETag, and the
+    // server would answer the authenticated one with a 304 for it: the retry
+    // goes out without the validator, so the response is the full 200.
+    var r: TestCacheRequest = .{};
+    defer r.deinit();
+    try parker.answer(client, &r, url);
+    try testing.expectEqual(false, r.from_cache);
+    try testing.expectEqual("secret", r.body.items);
+    // nothing renewed or replaced the entry
+    try expectCachedAt(&tc, url, 0, .revalidate);
+}
+
+test "HttpClient: a URL with userinfo bypasses the cache" {
+    const client = &testing.test_browser.http_client;
+    var tc = try TestCache.init(client);
+    tc.use(client);
+    defer tc.deinit(client);
+
+    {
+        var r: TestCacheRequest = .{};
+        defer r.deinit();
+        try r.run(client, "http://u:p@127.0.0.1:9582/cache/max-age");
+    }
+    try expectCachedAt(&tc, "http://u:p@127.0.0.1:9582/cache/max-age", 0, .miss);
+    try expectCachedAt(&tc, "http://127.0.0.1:9582/cache/max-age", 0, .miss);
+
+    {
+        var r: TestCacheRequest = .{};
+        defer r.deinit();
+        try r.run(client, "http://127.0.0.1:9582/cache/max-age");
+    }
+    var r: TestCacheRequest = .{};
+    defer r.deinit();
+    try r.run(client, "http://u:p@127.0.0.1:9582/cache/max-age");
+    try testing.expectEqual(false, r.from_cache);
 }
