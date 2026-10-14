@@ -133,6 +133,9 @@ const SqliteCachePath = union(enum) {
     }
 };
 
+/// Fails with error.CacheUnavailable, logged here, when the cache's directory
+/// cannot be made or its database cannot be opened (unwritable or missing
+/// directory, a path that is a file, ...): Cache.init then runs without a cache.
 pub fn init(allocator: std.mem.Allocator, path: SqliteCachePath, options: Options) !SqliteCache {
     const pool_options: Pool.Options = .{
         .connections = options.connections,
@@ -143,12 +146,12 @@ pub fn init(allocator: std.mem.Allocator, path: SqliteCachePath, options: Option
         .memory => try Pool.init(allocator, ":memory:", pool_options),
         .path => |cache_dir| blk: {
             std.Io.Dir.cwd().createDirPath(lp.io, cache_dir) catch |e| {
-                log.err(
+                log.warn(
                     .cache,
                     "failed to make path",
                     .{ .kind = "SqliteCache", .path = cache_dir, .err = e },
                 );
-                return e;
+                return error.CacheUnavailable;
             };
 
             const full_path = try allocator.printSentinel(
@@ -157,7 +160,13 @@ pub fn init(allocator: std.mem.Allocator, path: SqliteCachePath, options: Option
                 0,
             );
             defer allocator.free(full_path);
-            break :blk try Pool.init(allocator, full_path, pool_options);
+            break :blk Pool.init(allocator, full_path, pool_options) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => {
+                    log.warn(.cache, "failed to open", .{ .kind = "SqliteCache", .path = full_path, .err = e });
+                    return error.CacheUnavailable;
+                },
+            };
         },
     };
     errdefer pool.deinit(allocator);

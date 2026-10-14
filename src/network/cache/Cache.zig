@@ -48,13 +48,21 @@ pub fn init(allocator: std.mem.Allocator, config: *const lp.Config) !Cache {
             .entry_limit = config.httpCacheEntryLimit(),
             .connections = config.httpCacheConnections(),
         },
-    ) catch |err| {
-        log.err(.cache, "failed to init", .{
-            .kind = "SqliteCache",
-            .path = cache_path,
-            .err = err,
-        });
-        return err;
+    ) catch |err| switch (err) {
+        // A cache that cannot be opened should not take the browser down
+        // with it: run without one.
+        error.CacheUnavailable => {
+            log.warn(.cache, "running without a cache", .{ .path = cache_path });
+            return .{ .kind = .noop };
+        },
+        else => {
+            log.err(.cache, "failed to init", .{
+                .kind = "SqliteCache",
+                .path = cache_path,
+                .err = err,
+            });
+            return err;
+        },
     };
 
     return .{
@@ -549,6 +557,37 @@ fn varyHeaders(arena: std.mem.Allocator, vary: ?[]const u8, request_headers: []c
 }
 
 const testing = @import("../../testing.zig");
+test "Cache: a cache directory that cannot be made runs without a cache" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A directory below a regular file cannot be made: the same failure as an
+    // unwritable or missing parent.
+    try tmp.dir.writeFile(lp.io, .{ .sub_path = "blocked", .data = "" });
+    const blocked = try testing.tmpPath(&tmp, "blocked/cache");
+    const config = try lp.Config.init(arena.allocator(), "test", .{ .serve = .{ .http_cache_dir = blocked } });
+    lp.log.expectLog(&.{ .cache, .cache });
+    var cache = try Cache.init(testing.allocator, &config);
+    defer cache.deinit();
+    try testing.expect(cache.active() == null);
+}
+
+test "Cache: a database that cannot be opened runs without a cache" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // cache.db is a directory: the directory exists, the database cannot open.
+    try tmp.dir.createDirPath(lp.io, "cache/cache.db");
+    const dir = try testing.tmpPath(&tmp, "cache");
+    const config = try lp.Config.init(arena.allocator(), "test", .{ .serve = .{ .http_cache_dir = dir } });
+    lp.log.expectLog(&.{ .cache, .cache });
+    var cache = try Cache.init(testing.allocator, &config);
+    defer cache.deinit();
+    try testing.expect(cache.active() == null);
+}
+
 test "Cache: ResponseDirectives.parse" {
     try testing.expectEqual(300, ResponseDirectives.parse("max-age=300").max_age);
     try testing.expectEqual(300, ResponseDirectives.parse("Max-Age=300").max_age);

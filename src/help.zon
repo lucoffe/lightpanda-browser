@@ -462,7 +462,8 @@
     \\          Defaults to 5.
     \\  --http-cache-dir <PATH>
     \\          Directory used as a filesystem cache for network resources. Omitting
-    \\          this disables caching.
+    \\          this disables caching. If the directory or its database cannot be
+    \\          opened, this is logged and the browser runs without a cache.
     \\          Defaults to no caching.
     \\  --http-cache-entry-limit <INT>
     \\          Maximum number of entries kept in the HTTP cache. The limit is
